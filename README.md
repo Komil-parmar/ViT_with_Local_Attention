@@ -44,6 +44,7 @@ Feel free to explore and have fun with it.
 A formal open-source license will be added later.  
 
 ## **🚀 Future Work**
+- 📌 Optimize the 'cls_token_in_every_window' case
 - 📌 Add training and fine-tuning scripts  
 - 📌 Implement efficient local attention techniques  
 - 📌 Implement variable sized cls token (n patches)

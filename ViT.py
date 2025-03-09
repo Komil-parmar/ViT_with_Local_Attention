@@ -165,7 +165,7 @@ class MultiHeadGlobalAttention(nn.Module):
                 return output  # Shape: (batch_size, seq_length, embed_dim)
 
 
-class MultiHeadLocalAttention(nn.Module):
+class MultiHeadLocalAttention_1D(nn.Module):
         def __init__(self, embed_dim, num_heads, window_size, dropout=0.1, cls_token_in_every_window=False):
                 """
                 Multi-head local attention mechanism
@@ -317,11 +317,146 @@ class MultiHeadLocalAttention(nn.Module):
                 return output
 
 
+class MultiHeadLocalAttention_2D(nn.Module):
+        def __init__(self, embed_dim: int, num_heads, window_size: int, dropout=0.1, cls_token_in_every_window=False):
+                """
+                Multi-head local attention mechanism
+                :param embed_dim: Embedding dimension
+                :param num_heads: Number of attention heads
+                :param window_size: Size of the local window
+                :param dropout: Dropout value
+                :param cls_token_in_every_window: Assuming that cls token is the first token in the sequence, whether to add cls token to the window of every other token or not.
+                        If False, will treat cls token as a normal token.
+                """
+                super().__init__()
+                assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+                self.embed_dim = embed_dim
+                self.num_heads = num_heads
+                self.head_dim = embed_dim // num_heads
+                self.scale = self.head_dim ** -0.5
+                self.window_size = window_size
+                self.padding = (window_size - 1) // 2  # Padding for same-length output
+                self.cls_token_in_every_window = cls_token_in_every_window
+
+                # Projection layers
+                self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3)
+                self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+                self.dropout = nn.Dropout(dropout)
+
+        def forward_with_cls(self, x: torch.Tensor, Hi: int, W: int) -> torch.Tensor:
+                """
+                Args:
+                    x: Tensor of shape (batch_size, seq_len, embed_dim)
+                Returns:
+                    Tensor of shape (batch_size, seq_len, embed_dim)
+                """
+
+                # Seperate Cls token from the input
+                cls_token = x[:, 0:1, :]  # (B, 1, E)
+                x = x[:, 1:, :]  # (B, L, E)
+
+                batch_size, seq_len, _ = x.shape
+
+                # Resize x to 4D tensor (B, C, H, W)
+                x = x.view(batch_size, Hi, W, -1).permute(0, 3, 1, 2)  # (B, E, H, W)
+
+                # Pad and unfold x
+                x = F.unfold(x, kernel_size=self.window_size, stride=1, padding=self.padding)
+                x = x.view(batch_size, self.embed_dim, -1, Hi * W).permute(0, 3, 2, 1)  # (B, Hi * W, window_size^2, E)
+
+                # Reshape x_unfold to combine batch size and number of windows
+                x = x.reshape(batch_size * Hi * W, int(self.window_size ** 2), self.embed_dim) # (B * Hi * W, window_size^2, E)
+
+                # Reshape for multi-head attention
+                Q, K, V = self.qkv_proj(x).view(batch_size * Hi * W, int(self.window_size ** 2), 3, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4).chunk(3, dim=3) # (B * Hi * W, H, window_size^2, 3, D)
+
+                # Process class token with global attention
+                cls_Q, cls_K, cls_V = self.qkv_proj(cls_token).view(batch_size, 3, self.num_heads, self.head_dim).permute(0, 2, 1, 3).chunk(3, dim=2)  # (B, H, 3, D)
+
+                Q_flat = Q[:, :, self.window_size ** 2 // 2, :] # (B * Hi * W, H, 1, D)
+                K_flat = K[:, :, self.window_size ** 2 // 2, :].view(batch_size, Hi * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, Hi * W, D)
+                V_flat = V[:, :, self.window_size ** 2 // 2, :].view(batch_size, Hi * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, Hi * W, D)
+
+                attn_scores_cls = torch.einsum('bhqd,bhkd->bhqk', cls_Q, K_flat) * self.scale
+                attn_weights_cls = F.softmax(attn_scores_cls, dim=-1)
+                attn_weights_cls = self.dropout(attn_weights_cls)
+                output_cls = torch.einsum('bhqk,bhkd->bhqd', attn_weights_cls, V_flat)  # (B, H, 1, D)
+
+                # Append cls token's K and V to each window
+                # print(K.shape, output_cls.repeat(K.size(0) // batch_size, 1, 1, 1).shape)
+                K = torch.cat([K.squeeze(3), output_cls.repeat(K.size(0) // batch_size, 1, 1, 1)],
+                                            dim=2)  # (B, H, W+1, D)
+                V = torch.cat([V.squeeze(3), output_cls.repeat(V.size(0) // batch_size, 1, 1, 1)],
+                                            dim=2)  # (B, H, W+1, D)
+
+                # Compute attention for rest tokens
+                attn_scores_rest = torch.matmul(Q_flat, K.transpose(-2, -1)) * self.scale
+                attn_weights_rest = F.softmax(attn_scores_rest, dim=-1)
+                attn_weights_rest = self.dropout(attn_weights_rest)
+                output_rest = torch.matmul(attn_weights_rest, V)  # (B, H, 1, D)
+
+                output_cls = output_cls.permute(0, 2, 1, 3).contiguous().view(batch_size, 1, -1)
+                output_cls = self.out_proj(output_cls)
+
+                output_rest = output_rest.permute(0, 2, 1, 3).contiguous().view(batch_size * Hi * W, 1,
+                                                                                -1)
+                output_rest = self.out_proj(output_rest)
+
+                output_rest = output_rest.view(batch_size, Hi * W, self.embed_dim)
+
+                # Combine cls and rest outputs
+                output = torch.cat([output_cls, output_rest], dim=1)
+
+                return output
+
+        def forward_without_cls(self, x, Hi, W):
+                """
+                Args:
+                    x: Tensor of shape (batch_size, seq_len, embed_dim)
+                Returns:
+                    Tensor of shape (batch_size, seq_len, embed_dim)
+                """
+
+                batch_size, seq_len, _ = x.shape
+
+                # Resize x to 4D tensor (B, C, H, W)
+                x = x.view(batch_size, Hi, W, -1).permute(0, 3, 1, 2)  # (B, E, H, W)
+
+                # Pad and unfold x
+                x = F.unfold(x, kernel_size=self.window_size, stride=1, padding=self.padding)
+                x = x.view(batch_size, self.embed_dim, -1, Hi * W).permute(0, 3, 2, 1)  # (B, Hi * W, window_size^2, E)
+
+                # Reshape x_unfold to combine batch size and number of windows
+                x = x.reshape(batch_size * Hi * W, int(self.window_size ** 2), self.embed_dim) # (B * Hi * W, window_size^2, E)
+
+                # Reshape for multi-head attention
+                Q, K, V = self.qkv_proj(x).view(batch_size * Hi * W, int(self.window_size ** 2), 3, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4).chunk(3, dim=3) # (B * Hi * W, H, window_size^2, 3, D)
+
+                Q = Q[:, :, self.window_size ** 2 // 2, :] # (B * Hi * W, H, 1, D)
+
+                # Compute attention for rest tokens
+                attn_scores = torch.matmul(Q, K.squeeze(3).transpose(-2, -1)) * self.scale
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                attn_weights = self.dropout(attn_weights)
+                output = torch.matmul(attn_weights, V.squeeze(3))  # (B, H, 1, D)
+
+                output = output.permute(0, 2, 1, 3).contiguous().view(batch_size * Hi * W, 1,
+                                                                                -1)
+                output = self.out_proj(output)
+
+                output = output.view(batch_size, Hi * W, self.embed_dim)
+
+                return output
+
+
+
 class TransformerEncoderLayer(nn.Module):
         def __init__(self, embed_dim, num_heads, mlp_dim, dropout, window_size=None, cls_token_in_every_window=False):
                 super().__init__()
-                self.attention = MultiHeadLocalAttention(embed_dim, num_heads, window_size, dropout,
-                                                         cls_token_in_every_window) if window_size is not None else MultiHeadGlobalAttention(
+                self.attention = MultiHeadLocalAttention_2D(embed_dim, num_heads, window_size, dropout,
+                                                            cls_token_in_every_window) if window_size is not None else MultiHeadGlobalAttention(
                         embed_dim, num_heads)
                 self.norm1 = nn.LayerNorm(embed_dim)
                 self.mlp = nn.Sequential(
@@ -333,9 +468,15 @@ class TransformerEncoderLayer(nn.Module):
                 self.dropout = nn.Dropout(dropout)
 
                 self.window_size = window_size
+                self.cls_token_in_every_window = cls_token_in_every_window
 
         def forward(self, x):
-                x = x + self.dropout(self.attention(self.norm1(x)))
+                if self.cls_token_in_every_window and self.window_size is not None:
+                        x = x + self.dropout(self.attention.forward_with_cls(self.norm1(x), 14, 14))
+                elif self.cls_token_in_every_window is False and self.window_size is not None:
+                        x = x + self.dropout(self.attention.forward_without_cls(self.norm1(x), 14, 14))
+                else:
+                        x = x + self.dropout(self.attention(self.norm1(x)))
                 x = x + self.dropout(self.mlp(self.norm2(x)))
                 return x
 
@@ -436,16 +577,26 @@ class VisionTransformer(nn.Module):
 
 
 if __name__ == '__main__':
-        # Global Attention
-        model = VisionTransformer(img_size=224, patch_size=16, in_channels=3, num_classes=1000, embed_dim=768, num_heads=12, num_layers=12, mlp_dim=3072, dropout=0.1)
-        model = model.to('cuda')
-        x = torch.randn(1, 3, 224, 224).to('cuda')
-        torchsummary.summary(model, (3, 224, 224))
-        print(model(x).shape)
+        import timeit
+        N_TRIAL = 100
 
-        # Local Attention
-        model = VisionTransformer(img_size=224, patch_size=16, in_channels=3, num_classes=1000, embed_dim=768, num_heads=12, num_layers=12, mlp_dim=3072, dropout=0.1, window_size=[3, 3, 5, 5, 7, 7, 9, 9, None, None, None, None])
-        model = model.to('cuda')
-        x = torch.randn(1, 3, 224, 224).to('cuda')
-        torchsummary.summary(model, (3, 224, 224))
-        print(model(x).shape)
+        # Test global attention
+        mhga = MultiHeadGlobalAttention(768, 12,).cuda()
+        x = torch.randn(1, 196, 768).to('cuda')
+        t_mhga = timeit.timeit(lambda: mhga.forward(x), number=N_TRIAL)
+        print("Global attention Time (without cls token): ", t_mhga)
+        print(t_mhga / t_mhga, "times faster than global attention")
+
+        mhla = MultiHeadLocalAttention_2D(768, 12, 3, 0.1, ).cuda()
+
+        # Test local attention without cls token
+        x = torch.randn(1, 196, 768).to('cuda')
+        t_mhla = timeit.timeit(lambda: mhla.forward_without_cls(x, 14, 14), number=N_TRIAL)
+        print("Local Attention Time (without cls token): ", t_mhla)
+        print(t_mhga / t_mhla, "times faster than global attention")
+
+        # Test local attention with cls token in every window
+        x = torch.randn(1, 197, 768).to('cuda')
+        t_mhla = timeit.timeit(lambda: mhla.forward_with_cls(x, 14, 14), number=N_TRIAL)
+        print("Local Attention Time (with cls token): ", t_mhla)
+        print(t_mhga / t_mhla, "times faster than global attention")
